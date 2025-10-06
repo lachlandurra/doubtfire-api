@@ -108,7 +108,7 @@ module AuthenticationHelpers
   # Returns true if using SAML2.0 auth strategy
   #
   def saml_auth?
-    Doubtfire::Application.config.auth_method == :saml
+    %i[saml saml_oauth].include?(Doubtfire::Application.config.auth_method)
   end
 
   #
@@ -130,5 +130,17 @@ module AuthenticationHelpers
   #
   def db_auth?
     Doubtfire::Application.config.auth_method == :database
+  end
+
+  def oauth_enabled?
+    Doubtfire::Application.config.oauth_enabled?
+  end
+
+  def oauth_public_providers
+    Doubtfire::Application.config.oauth_public_providers
+  end
+
+  def oauth_provider_config(provider)
+    Doubtfire::Application.config.oauth_provider_for(provider)
   end
 end

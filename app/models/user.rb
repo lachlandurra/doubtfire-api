@@ -143,6 +143,8 @@ class User < ApplicationRecord
   has_many    :unit_roles, dependent: :destroy, inverse_of: :user
   has_many    :projects, dependent: :restrict_with_exception, inverse_of: :user
   has_many    :auth_tokens, dependent: :destroy, inverse_of: :user
+  has_many    :oauth_identities, dependent: :destroy, inverse_of: :user
+  has_many    :oauth_states, dependent: :destroy, inverse_of: :user
   has_many    :user_oauth_tokens, dependent: :destroy, inverse_of: :user
   has_many    :user_oauth_states, dependent: :destroy, inverse_of: :user
   has_one     :webcal, dependent: :destroy, inverse_of: :user
@@ -398,6 +400,48 @@ class User < ApplicationRecord
   # Get all of the currently valid auth tokens
   def valid_auth_tokens
     auth_tokens.where("auth_token_expiry > :now", now: Time.zone.now)
+  end
+
+  ###
+  # OAuth identities
+  ###
+  def oauth_identity_for(provider)
+    oauth_identities.find_by(provider: provider.to_s)
+  end
+
+  def link_oauth_identity!(provider:, uid:, verified_email: nil, raw_info: nil, refresh_token: nil)
+    identity = oauth_identities.find_or_initialize_by(provider: provider.to_s, uid: uid)
+    identity.verified_email = verified_email unless verified_email.nil?
+    identity.raw_info = raw_info.nil? ? (identity.raw_info || {}) : raw_info
+    identity.refresh_token_encrypted = refresh_token unless refresh_token.nil?
+    identity.last_used_at = Time.zone.now
+    identity.save!
+    identity
+  end
+
+  def primary_identity_provider
+    oauth_identities.order(last_used_at: :desc, created_at: :desc).first&.provider
+  end
+
+  #
+  # Determine whether unlinking the supplied OAuth identity would leave the user
+  # without any viable authentication mechanism.
+  #
+  def safe_to_unlink_oauth_identity?(identity)
+    remaining_oauth_identities = oauth_identities.where.not(id: identity&.id).exists?
+    return true if remaining_oauth_identities
+
+    return true if AuthenticationHelpers.db_auth? || AuthenticationHelpers.ldap_auth?
+
+    if AuthenticationHelpers.saml_auth? || AuthenticationHelpers.aaf_auth?
+      return true if saml_identity_available?
+    end
+
+    false
+  end
+
+  def saml_identity_available?
+    login_id.present? && login_id.include?('@')
   end
 
   def name

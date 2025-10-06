@@ -7,6 +7,12 @@ Doubtfire::Application.routes.draw do
   get 'api/submission/unit/:id/task_definitions/:task_def_id/student_pdfs', to: 'task_submission_pdfs#index'
   get 'api/units/:id/all_resources', to: 'lecture_resource_downloads#index'
 
+  scope '/api/auth/oauth', module: :api, as: :api_auth_oauth do
+    get ':provider/start', to: 'oauth#start', as: :start
+    match ':provider/callback', to: 'oauth#callback', via: %i[get post], as: :callback
+    match 'failure', to: 'oauth#failure', via: %i[get post], as: :failure
+  end
+
   mount ApiRoot => '/'
   mount GrapeSwaggerRails::Engine => '/api/docs'
   mount Sidekiq::Web => "/sidekiq" # mount Sidekiq::Web in your Rails app

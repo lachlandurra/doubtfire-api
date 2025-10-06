@@ -2,6 +2,8 @@ require 'grape'
 require 'json/jwt'
 require 'onelogin/ruby-saml'
 require 'entities/user_entity'
+require 'securerandom'
+require 'uri'
 
 #
 # Provides the authentication API for Doubtfire.
@@ -13,6 +15,51 @@ class AuthenticationApi < Grape::API
   helpers AuthenticationHelpers
   helpers AuthorisationHelpers
 
+  helpers do
+    def ensure_oauth_available!
+      error!({ error: 'OAuth authentication is not configured.' }, 404) unless oauth_enabled?
+    end
+
+    def ensure_oauth_provider!(provider)
+      error!({ error: 'Unknown OAuth provider.' }, 404) unless oauth_provider_config(provider).present?
+    end
+
+    def sanitise_redirect_path(raw)
+      return nil if raw.blank?
+
+      uri = URI.parse(raw)
+      if uri.host.present?
+        return raw if allowed_redirect_uri?(uri)
+
+        return nil
+      end
+
+      raw.starts_with?('/') ? raw : "/#{raw}"
+    rescue URI::InvalidURIError
+      nil
+    end
+
+    def allowed_redirect_hosts
+      Array(Doubtfire::Application.config.oauth_allowed_redirect_hosts)
+    end
+
+    def allowed_redirect_uri?(uri)
+      allowed = allowed_redirect_hosts
+      return true if allowed.empty?
+
+      host = uri.host
+      return false if host.blank?
+
+      host_with_port = uri.port ? "#{host}:#{uri.port}" : host
+      allowed.include?(host_with_port) || allowed.include?(host)
+    end
+
+    def oauth_handshake_path(provider, state_token)
+      query = { state: state_token }.to_query
+      "/api/auth/oauth/#{provider}/start?#{query}"
+    end
+  end
+
   #
   # Sign in - only mounted if AAF auth is NOT used
   #
@@ -20,34 +67,60 @@ class AuthenticationApi < Grape::API
     desc 'Sign in'
     params do
       requires :username, type: String, desc: 'User username'
-      requires :password, type: String, desc: 'User\'s password'
+      optional :password, type: String, desc: 'User\'s password'
+      optional :auth_token, type: String, desc: 'Temporary login token issued by an external provider'
       optional :remember, type: Boolean, desc: 'User has requested to remember login', default: false
     end
     post '/auth' do
-      username = params[:username]
-      password = params[:password]
+      raw_username = params[:username]
+      password = params[:password].presence
+      login_token = params[:auth_token].presence
       remember = params[:remember]
-      logger.info "Authenticate #{username} from #{request.ip}"
+
+      if raw_username.blank?
+        error!({ error: 'The request must contain the user username and credentials.' }, 400)
+      end
+
+      username = raw_username.dup
 
       # Truncate the 's' from sXXX for Swinburne auth
       truncate_s_match = (username =~ /^[Ss]\d{6,10}([Xx]|\d)$/)
       username[0] = '' if !truncate_s_match.nil? && truncate_s_match.zero?
 
-      # No provided credentials
-      if username.nil? || password.nil?
+      normalized_username = username.downcase
+      logger.info "Authenticate #{normalized_username} from #{request.ip}"
+
+      if login_token.present?
+        user = User.eager_load(:auth_tokens).find_by(username: normalized_username)
+        token = user&.token_for_text?(login_token, :login)
+
+        if user.nil? || token.nil? || token.auth_token_expiry <= Time.zone.now
+          token&.destroy!
+          error!({ error: 'Invalid authentication details.' }, 404)
+        end
+
+        token.destroy!
+        session_token = user.generate_authentication_token!(remember: remember)
+
+        logger.info "Login #{normalized_username} from #{request.ip}"
+
+        present :user, user, with: Entities::UserEntity
+        present :auth_token, session_token.authentication_token
+        return
+      end
+
+      if password.blank?
         error!({ error: 'The request must contain the user username and password.' }, 400)
       end
 
-      # User lookup
-      username = username.downcase
       institution_email_domain = Doubtfire::Application.config.institution[:email_domain]
-      user = User.find_or_create_by(username: username) do |new_user|
+      user = User.find_or_create_by(username: normalized_username) do |new_user|
         new_user.first_name = 'First Name'
         new_user.last_name  = 'Surname'
-        new_user.email      = "#{username}@#{institution_email_domain}"
+        new_user.email      = "#{normalized_username}@#{institution_email_domain}"
         new_user.nickname   = 'Nickname'
         new_user.role_id    = Role.student.id
-        new_user.login_id   = username
+        new_user.login_id   = normalized_username
       end
 
       # Try to authenticate
@@ -68,7 +141,7 @@ class AuthenticationApi < Grape::API
         user.save
       end
 
-      logger.info "Login #{username} from #{request.ip}"
+      logger.info "Login #{normalized_username} from #{request.ip}"
 
       # Return user details
       present :user, user, with: Entities::UserEntity
@@ -275,7 +348,80 @@ class AuthenticationApi < Grape::API
         request = OneLogin::RubySaml::Authrequest.new
         request.create(AuthenticationHelpers.saml_settings)
       end
+    if oauth_enabled?
+      response[:oauth_enabled] = true
+      response[:oauth_providers] = oauth_public_providers
+    end
     present response, with: Grape::Presenters::Presenter
+  end
+
+  desc 'List linked OAuth identities'
+  get '/auth/oauth/identities' do
+    ensure_oauth_available!
+    authenticated?(:general)
+
+    user = current_user
+    primary_provider = user.primary_identity_provider
+
+    identities = user.oauth_identities.order(last_used_at: :desc, created_at: :desc).map do |identity|
+      {
+        provider: identity.provider,
+        uid: identity.uid,
+        verified_email: identity.verified_email,
+        last_used_at: identity.last_used_at&.iso8601,
+        primary: identity.provider == primary_provider
+      }.compact
+    end
+
+    present({ identities: identities }, with: Grape::Presenters::Presenter)
+  end
+
+  desc 'Begin OAuth provider linking flow'
+  params do
+    optional :redirect_path, type: String, desc: 'Optional path to redirect to after linking'
+  end
+  post '/auth/oauth/:provider/link' do
+    ensure_oauth_available!
+    provider = params[:provider].to_s
+    ensure_oauth_provider!(provider)
+    authenticated?(:general)
+
+    user = current_user
+    redirect_path = sanitise_redirect_path(params[:redirect_path])
+
+    state = user.oauth_states.create!(
+      token: SecureRandom.uuid,
+      purpose: Api::OauthController::PURPOSE_LINK,
+      provider: provider,
+      redirect_path: redirect_path
+    )
+
+    logger.info "[OAuth] link start user_id=#{user.id} provider=#{provider} redirect_path=#{redirect_path}"
+
+    present({ redirect_to: oauth_handshake_path(provider, state.token) }, with: Grape::Presenters::Presenter)
+  end
+
+  desc 'Unlink an OAuth provider from the authenticated user'
+  delete '/auth/oauth/:provider' do
+    ensure_oauth_available!
+    provider = params[:provider].to_s
+    authenticated?(:general)
+
+    user = current_user
+    identity = user.oauth_identity_for(provider)
+
+    error!({ error: 'OAuth identity not linked.' }, 404) unless identity
+
+    unless user.safe_to_unlink_oauth_identity?(identity)
+      logger.warn "[OAuth] unlink blocked user_id=#{user.id} provider=#{provider} reason=final_auth_method"
+      error!({ error: 'You must add another sign-in method before unlinking this provider.' }, 422)
+    end
+
+    identity.destroy!
+
+    logger.info "[OAuth] unlink user_id=#{user.id} provider=#{provider}"
+
+    present nil
   end
 
   #

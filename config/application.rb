@@ -2,6 +2,7 @@ require File.expand_path('../boot', __FILE__)
 require 'rails/all'
 require 'csv'
 require 'yaml'
+require 'uri'
 require 'bunny-pub-sub/services_manager'
 
 # Precompile assets before deploying to production
@@ -118,6 +119,102 @@ module Doubtfire
         raise "Missing IDP certificate for SAML config: \n"
       end
     end
+
+    # ==> OAuth authentication
+    config.oauth_providers = HashWithIndifferentAccess.new
+    oauth_provider_keys = ENV.fetch('DF_OAUTH_PROVIDERS', nil).to_s.split(',').map do |provider|
+      provider.strip.downcase
+    end.reject(&:blank?).uniq
+
+    oauth_provider_keys.each do |provider_key|
+      case provider_key
+      when 'google'
+        client_id = ENV['DF_OAUTH_GOOGLE_CLIENT_ID']
+        client_secret = ENV['DF_OAUTH_GOOGLE_CLIENT_SECRET']
+        redirect_uri = ENV['DF_OAUTH_GOOGLE_REDIRECT_URI']
+
+        if client_id.present? && client_secret.present? && redirect_uri.present?
+          config.oauth_providers[:google] = {
+            name: ENV.fetch('DF_OAUTH_GOOGLE_DISPLAY_NAME', 'Google'),
+            client_id: client_id,
+            client_secret: client_secret,
+            scope: ENV.fetch('DF_OAUTH_GOOGLE_SCOPE', 'openid,email,profile'),
+            redirect_uri: redirect_uri,
+            access_type: ENV['DF_OAUTH_GOOGLE_ACCESS_TYPE'],
+            prompt: ENV['DF_OAUTH_GOOGLE_PROMPT'],
+            hosted_domain: ENV['DF_OAUTH_GOOGLE_HOSTED_DOMAIN'],
+            icon: ENV['DF_OAUTH_GOOGLE_ICON'] || 'google'
+          }.with_indifferent_access
+        else
+          warn '[OAuth] Google provider configured but missing DF_OAUTH_GOOGLE_CLIENT_ID, DF_OAUTH_GOOGLE_CLIENT_SECRET, or DF_OAUTH_GOOGLE_REDIRECT_URI environment variables.'
+        end
+      else
+        warn "[OAuth] Unsupported provider configured: #{provider_key}"
+      end
+    end
+
+    config.oauth_enabled = config.oauth_providers.present?
+
+    if config.auth_method == :saml && config.oauth_enabled
+      config.auth_method = :saml_oauth
+    end
+
+    config.define_singleton_method(:oauth_enabled?) do
+      !!oauth_enabled
+    end
+
+    config.define_singleton_method(:oauth_provider_for) do |provider_key|
+      (oauth_providers || {}).with_indifferent_access[provider_key]
+    end
+
+    config.define_singleton_method(:oauth_public_providers) do
+      (oauth_providers || {}).map do |key, provider|
+        {
+          key: key.to_s,
+          name: provider[:name] || key.to_s.titleize,
+          icon: provider[:icon],
+          priority: provider[:priority]
+        }.compact
+      end.sort_by { |provider| provider[:priority] || Float::INFINITY }
+    end
+
+    config.oauth_default_redirect_uri =
+      if (explicit = ENV['DF_OAUTH_DEFAULT_REDIRECT_URI']).present?
+        explicit
+      elsif (host = config.institution[:host]).present?
+        begin
+          uri = URI.parse(host)
+          uri = URI.parse("https://#{host}") if uri.scheme.blank?
+          uri.path = '/sign_in' if uri.path.blank? || uri.path == '/'
+          uri.query = nil
+          uri.fragment = nil
+          uri.to_s
+        rescue URI::InvalidURIError
+          nil
+        end
+      end
+
+    oauth_allowed_redirect_hosts = ENV.fetch('DF_OAUTH_ALLOWED_REDIRECT_HOSTS', nil)
+                                    .to_s.split(',').map { |host| host.strip }
+                                    .reject(&:blank?)
+
+    [config.oauth_default_redirect_uri, config.institution[:host]].compact.each do |url|
+      begin
+        uri = URI.parse(url)
+        uri = URI.parse("https://#{url}") if uri.scheme.blank?
+        host = uri.host
+        next if host.blank?
+
+        oauth_allowed_redirect_hosts << host
+        if uri.port && ![80, 443].include?(uri.port)
+          oauth_allowed_redirect_hosts << "#{host}:#{uri.port}"
+        end
+      rescue URI::InvalidURIError
+        next
+      end
+    end
+
+    config.oauth_allowed_redirect_hosts = oauth_allowed_redirect_hosts.uniq
 
     # ==> AAF authentication
     # Must require AAF devise authentication method.

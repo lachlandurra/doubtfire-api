@@ -1,0 +1,215 @@
+# frozen_string_literal: true
+
+require 'securerandom'
+
+module Oauth
+  class IdentityResolver
+    Resolution = Struct.new(
+      :user,
+      :identity,
+      :status,
+      :new_user,
+      :linked_identity,
+      :redirect_path,
+      keyword_init: true
+    )
+
+    class ResolutionError < StandardError
+      attr_reader :code
+
+      def initialize(message, code: 'resolution_error')
+        super(message)
+        @code = code
+      end
+    end
+
+    def initialize(provider:, auth_hash:, state: nil)
+      @provider = provider.to_s
+      @auth_hash = auth_hash
+      @state = state
+    end
+
+    def resolve!
+      raise ResolutionError.new('OAuth response missing provider or uid.', code: 'invalid_auth') if provider.blank? || uid.blank?
+
+      if existing_identity
+        update_existing_identity!
+        return build_resolution(existing_identity.user, existing_identity, status: 'existing_identity', linked: false, new_user: false)
+      end
+
+      if linking_flow?
+        user = linked_user_from_state
+        identity = link_identity!(user)
+        return build_resolution(user, identity, status: 'linked_identity', linked: true, new_user: false)
+      end
+
+      if match_user = locate_user_by_email
+        identity = link_identity!(match_user)
+        return build_resolution(match_user, identity, status: 'matched_existing_user', linked: true, new_user: false)
+      end
+
+      identity = create_user_and_identity!
+      build_resolution(identity.user, identity, status: 'created_user', linked: true, new_user: true)
+    end
+
+    private
+
+    attr_reader :provider, :auth_hash, :state
+
+    def uid
+      @uid ||= auth_hash['uid'] || auth_hash[:uid]
+    end
+
+    def info
+      @info ||= begin
+        raw = auth_hash['info'] || auth_hash[:info] || {}
+        raw.is_a?(Hash) ? raw.with_indifferent_access : raw
+      end
+    end
+
+    def credentials
+      @credentials ||= begin
+        raw = auth_hash['credentials'] || auth_hash[:credentials] || {}
+        raw.is_a?(Hash) ? raw.with_indifferent_access : raw
+      end
+    end
+
+    def extra_raw_info
+      extra = auth_hash['extra'] || auth_hash[:extra] || {}
+      raw_info = extra.respond_to?(:[]) ? (extra['raw_info'] || extra[:raw_info] || {}) : {}
+      raw_info.is_a?(Hash) ? raw_info.with_indifferent_access : raw_info
+    end
+
+    def verified_email
+      info['email'] if truthy?(info['email_verified'])
+    end
+
+    def primary_email
+      info['email'] || extra_raw_info['email']
+    end
+
+    def existing_identity
+      @existing_identity ||= OauthIdentity.find_by(provider: provider, uid: uid)
+    end
+
+    def linking_flow?
+      state&.purpose == 'link' && state.user.present?
+    end
+
+    def linked_user_from_state
+      user = state&.user
+      raise ResolutionError.new('Unable to link identity without user.', code: 'missing_user') if user.nil?
+
+      user
+    end
+
+    def locate_user_by_email
+      email = verified_email || primary_email
+      return nil if email.blank?
+
+      User.find_by(email: email.downcase)
+    end
+
+    def link_identity!(user)
+      ensure_identity_is_available!
+      user.link_oauth_identity!(
+        provider: provider,
+        uid: uid,
+        verified_email: verified_email,
+        raw_info: merged_raw_info,
+        refresh_token: credentials['refresh_token']
+      )
+    end
+
+    def create_user_and_identity!
+      email = verified_email || primary_email
+      raise ResolutionError.new('OAuth provider did not supply an email address.', code: 'missing_email') if email.blank?
+
+      ensure_identity_is_available!
+
+      first_name, last_name = derive_names
+      username = generate_unique_username(email)
+
+      user = User.new(
+        first_name: first_name,
+        last_name: last_name,
+        email: email.downcase,
+        username: username,
+        nickname: first_name,
+        role_id: Role.student_id,
+        login_id: username
+      )
+      user.password = SecureRandom.hex(16)
+
+      unless user.save
+        raise ResolutionError.new("Unable to create user: #{user.errors.full_messages.join(', ')}", code: 'user_creation_failed')
+      end
+
+      link_identity!(user)
+    end
+
+    def derive_names
+      first = info['first_name'] || info['given_name'] || info['name']&.split&.first || 'OAuth'
+      last = info['last_name'] || info['family_name'] || info['name']&.split&.last || 'User'
+      [first, last]
+    end
+
+    def generate_unique_username(email)
+      base = email.split('@').first.downcase.gsub(/[^a-z0-9_.-]/, '')
+      base = 'user' if base.blank?
+      candidate = base
+      suffix = 0
+
+      while User.exists?(username: candidate)
+        suffix += 1
+        candidate = "#{base}#{suffix}"
+      end
+
+      candidate
+    end
+
+    def merged_raw_info
+      extra_raw_info.merge(info) { |_, old, new| old.presence || new }
+    end
+
+    def update_existing_identity!
+      identity = existing_identity
+      identity.update!(
+        verified_email: verified_email.presence || identity.verified_email,
+        raw_info: merged_raw_info,
+        refresh_token_encrypted: credentials['refresh_token'].presence || identity.refresh_token_encrypted,
+        last_used_at: Time.zone.now
+      )
+    end
+
+    def ensure_identity_is_available!
+      conflict = OauthIdentity.find_by(provider: provider, uid: uid)
+      return unless conflict && !linking_same_user?(conflict)
+
+      raise ResolutionError.new('OAuth identity already linked to another user.', code: 'identity_claimed')
+    end
+
+    def linking_same_user?(identity)
+      return false if state&.user.nil?
+
+      identity.user_id == state.user_id
+    end
+
+    def build_resolution(user, identity, status:, linked:, new_user:, redirect_path: nil)
+      Resolution.new(
+        user: user,
+        identity: identity,
+        status: status,
+        linked_identity: linked,
+        new_user: new_user,
+        redirect_path: redirect_path
+      )
+    end
+
+    def truthy?(value)
+      value == true || value.to_s.casecmp('true').zero?
+    rescue
+      false
+    end
+  end
+end

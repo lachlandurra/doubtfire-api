@@ -9,6 +9,73 @@ class AuthTest < ActiveSupport::TestCase
     Rails.application
   end
 
+  def with_auth_config(auth_method: nil, oauth_providers: nil, oauth_enabled: nil, saml: :__no_change__)
+    config = Doubtfire::Application.config
+
+    original_auth_method = config.auth_method
+    original_oauth_providers = if config.oauth_providers.present?
+                                 config.oauth_providers.deep_dup
+                               else
+                                 ActiveSupport::HashWithIndifferentAccess.new
+                               end
+    original_oauth_enabled = config.oauth_enabled
+    saml_accessor_defined = config.respond_to?(:saml) && config.respond_to?(:saml=)
+    original_saml = saml_accessor_defined ? config.saml&.dup : nil
+    created_saml_accessor = false
+
+    config.auth_method = auth_method if auth_method
+    unless oauth_providers.nil?
+      config.oauth_providers = oauth_providers.with_indifferent_access
+    end
+    unless oauth_enabled.nil?
+      config.oauth_enabled = oauth_enabled
+    end
+    if saml != :__no_change__
+      unless config.respond_to?(:saml=)
+        config.singleton_class.attr_accessor :saml
+        created_saml_accessor = true
+      end
+      config.saml = saml.nil? ? nil : saml.with_indifferent_access
+    end
+
+    yield
+  ensure
+    config.auth_method = original_auth_method
+    config.oauth_providers = original_oauth_providers
+    config.oauth_enabled = original_oauth_enabled
+    if config.respond_to?(:saml=)
+      if saml_accessor_defined
+        config.saml = original_saml
+      elsif created_saml_accessor
+        config.singleton_class.send(:remove_method, :saml=)
+        config.singleton_class.send(:remove_method, :saml)
+      end
+    end
+  end
+
+  def oauth_provider_config_stub
+    {
+      google: {
+        name: 'Google',
+        client_id: 'client-id',
+        client_secret: 'secret',
+        redirect_uri: 'https://example.com/callback'
+      }
+    }
+  end
+
+  def saml_config_stub
+    {
+      SAML_metadata_url: nil,
+      assertion_consumer_service_url: 'https://example.com/api/auth/jwt',
+      entity_id: 'https://example.com/sp',
+      idp_sso_target_url: 'https://idp.example.com/sso',
+      idp_sso_signout_url: 'https://idp.example.com/logout',
+      idp_sso_cert: '-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----',
+      idp_name_identifier_format: 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress'
+    }
+  end
+
   # --------------------------------------------------------------------------- #
   # --- Endpoint testing for:
   # ------- /api/auth.json
@@ -106,6 +173,35 @@ class AuthTest < ActiveSupport::TestCase
     assert actual_auth.key?('error'), actual_auth.inspect
   end
 
+  def test_auth_with_temporary_login_token
+    with_auth_config(auth_method: :database, oauth_enabled: true) do
+      user = FactoryBot.create(:user)
+      login_token = user.generate_temporary_authentication_token!
+
+      post_json '/api/auth.json', {
+        username: user.username,
+        auth_token: login_token.authentication_token,
+        remember: true
+      }
+
+      assert_equal 201, last_response.status
+      body = last_response_body
+
+      assert body.key?('user'), body.inspect
+      assert body.key?('auth_token'), body.inspect
+      assert_equal user.id, body['user']['id']
+      refute_equal login_token.authentication_token, body['auth_token']
+
+      assert_raises(ActiveRecord::RecordNotFound) { login_token.reload }
+
+      user.reload
+      assert_nil user.token_for_text?(login_token.authentication_token, :login)
+      exchanged_token = user.token_for_text?(body['auth_token'], :general)
+      assert exchanged_token.present?
+      assert_equal 'general', exchanged_token.token_type
+    end
+  end
+
   # Test auth with tutor role
   def test_auth_roles
     post_tests = [
@@ -164,6 +260,77 @@ class AuthTest < ActiveSupport::TestCase
     expected_auth = auth_token
     # Check to see if the response auth token matches the auth token that was sent through in put
     assert_equal expected_auth, actual_auth
+  end
+
+  def test_auth_method_without_oauth_in_database_mode
+    with_auth_config(auth_method: :database, oauth_providers: {}, oauth_enabled: false) do
+      header 'Host', 'localhost'
+      get '/api/auth/method'
+
+      assert_equal 200, last_response.status
+      body = last_response_body
+
+      assert_equal 'database', body['method']
+      refute body.key?('oauth_enabled'), body.inspect
+      refute body.key?('oauth_providers'), body.inspect
+      header 'Host', nil
+    end
+  end
+
+  def test_auth_method_without_oauth_in_saml_mode
+    with_auth_config(auth_method: :saml, oauth_providers: {}, oauth_enabled: false, saml: saml_config_stub) do
+      header 'Host', 'localhost'
+      get '/api/auth/method'
+
+      assert_equal 200, last_response.status
+      body = last_response_body
+
+      assert_equal 'saml', body['method']
+      assert body.key?('redirect_to'), body.inspect
+      refute body.key?('oauth_enabled'), body.inspect
+      header 'Host', nil
+    end
+  end
+
+  def test_unlink_rejected_when_identity_is_last_sign_in_method
+    with_auth_config(auth_method: :saml_oauth, oauth_providers: oauth_provider_config_stub, oauth_enabled: true) do
+      user = FactoryBot.create(:user, login_id: 'oauthuser')
+      identity = user.link_oauth_identity!(provider: 'google', uid: 'uid-1', raw_info: {})
+
+      add_auth_header_for(user: user)
+      header 'Host', 'localhost'
+      delete_json '/api/auth/oauth/google'
+
+      assert_equal 422, last_response.status
+      body = last_response_body
+      assert_equal 'You must add another sign-in method before unlinking this provider.', body['error']
+      assert OauthIdentity.exists?(identity.id)
+
+      clear_auth_header
+      header 'Host', nil
+    end
+  end
+
+  def test_unlink_allowed_when_user_has_saml_identity
+    with_auth_config(auth_method: :saml_oauth, oauth_providers: oauth_provider_config_stub, oauth_enabled: true) do
+      user = FactoryBot.create(:user, login_id: 'user@example.com')
+      identity = user.link_oauth_identity!(provider: 'google', uid: 'uid-2', raw_info: {})
+
+      add_auth_header_for(user: user)
+      header 'Host', 'localhost'
+      delete_json '/api/auth/oauth/google'
+
+      assert_includes [200, 204], last_response.status
+      if last_response.status == 200
+        assert_nil last_response_body
+      else
+        assert_equal '', last_response.body
+      end
+      refute OauthIdentity.exists?(identity.id)
+
+      clear_auth_header
+      header 'Host', nil
+    end
   end
 
   def test_auth_using_query_string

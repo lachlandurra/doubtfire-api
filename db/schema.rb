@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[7.1].define(version: 2024_12_17_091744) do
+ActiveRecord::Schema[7.1].define(version: 2025_10_05_200630) do
   create_table "activity_types", charset: "utf8", collation: "utf8_unicode_ci", force: :cascade do |t|
     t.string "name", null: false
     t.string "abbreviation", null: false
@@ -151,6 +151,35 @@ ActiveRecord::Schema[7.1].define(version: 2024_12_17_091744) do
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
     t.index ["user_id"], name: "index_logins_on_user_id"
+  end
+
+  create_table "oauth_identities", charset: "utf8mb4", collation: "utf8mb4_general_ci", force: :cascade do |t|
+    t.bigint "user_id", null: false
+    t.string "provider", null: false
+    t.string "uid", null: false
+    t.string "verified_email"
+    t.text "raw_info", size: :long, null: false, collation: "utf8mb4_bin"
+    t.text "refresh_token_encrypted"
+    t.datetime "last_used_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["provider", "uid"], name: "index_oauth_identities_on_provider_and_uid", unique: true
+    t.index ["user_id"], name: "index_oauth_identities_on_user_id"
+    t.check_constraint "json_valid(`raw_info`)", name: "raw_info"
+  end
+
+  create_table "oauth_states", charset: "utf8mb4", collation: "utf8mb4_general_ci", force: :cascade do |t|
+    t.string "token", null: false
+    t.string "purpose", null: false
+    t.bigint "user_id"
+    t.string "provider", null: false
+    t.string "redirect_path"
+    t.string "code_verifier"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["created_at"], name: "index_oauth_states_on_created_at_for_expiry"
+    t.index ["token"], name: "index_oauth_states_on_token", unique: true
+    t.index ["user_id"], name: "index_oauth_states_on_user_id"
   end
 
   create_table "overseer_assessments", charset: "utf8", collation: "utf8_unicode_ci", force: :cascade do |t|
@@ -591,6 +620,8 @@ ActiveRecord::Schema[7.1].define(version: 2024_12_17_091744) do
     t.index ["user_id"], name: "index_webcals_on_user_id", unique: true
   end
 
+  add_foreign_key "oauth_identities", "users"
+  add_foreign_key "oauth_states", "users"
   add_foreign_key "user_oauth_states", "users"
   add_foreign_key "user_oauth_tokens", "users"
 end
