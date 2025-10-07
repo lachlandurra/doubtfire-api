@@ -34,6 +34,28 @@ Rails.application.config.middleware.use OmniAuth::Builder do
       }.compact
 
       provider :google_oauth2, client_id, client_secret, options
+    when :github
+      client_id = provider_settings[:client_id]
+      client_secret = provider_settings[:client_secret]
+      redirect_uri = provider_settings[:redirect_uri]
+
+      next if client_id.blank? || client_secret.blank?
+
+      options = {
+        scope: provider_settings[:scope] || 'read:user,user:email',
+        name: provider_key.to_s,
+        path_prefix: '/api/auth/oauth',
+        callback_path: "/api/auth/oauth/#{provider_key}/callback",
+        provider_ignores_state: false
+      }.compact
+
+      if redirect_uri.present?
+        options[:client_options] = (
+          provider_settings[:client_options] || {}
+        ).merge(redirect_uri: redirect_uri)
+      end
+
+      provider :github, client_id, client_secret, options
     else
       Rails.logger.warn("Unsupported OAuth provider configured: #{provider_key}") if defined?(Rails)
     end

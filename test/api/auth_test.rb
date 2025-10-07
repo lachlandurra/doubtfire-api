@@ -59,7 +59,19 @@ class AuthTest < ActiveSupport::TestCase
         name: 'Google',
         client_id: 'client-id',
         client_secret: 'secret',
-        redirect_uri: 'https://example.com/callback'
+        redirect_uri: 'https://example.com/google/callback',
+        scope: 'openid,email,profile',
+        icon: 'google',
+        priority: 1
+      },
+      github: {
+        name: 'GitHub',
+        client_id: 'client-id',
+        client_secret: 'secret',
+        redirect_uri: 'https://example.com/github/callback',
+        scope: 'read:user,user:email',
+        icon: 'github',
+        priority: 2
       }
     }
   end
@@ -288,6 +300,39 @@ class AuthTest < ActiveSupport::TestCase
       assert_equal 'saml', body['method']
       assert body.key?('redirect_to'), body.inspect
       refute body.key?('oauth_enabled'), body.inspect
+      header 'Host', nil
+    end
+  end
+
+  def test_auth_method_with_multiple_oauth_providers
+    with_auth_config(auth_method: :database, oauth_providers: oauth_provider_config_stub, oauth_enabled: true) do
+      header 'Host', 'localhost'
+      get '/api/auth/method'
+
+      assert_equal 200, last_response.status
+      body = last_response_body
+
+      assert_equal true, body['oauth_enabled']
+      assert_equal %w[google github], body['oauth_providers'].map { |provider| provider['key'] }
+    ensure
+      header 'Host', nil
+    end
+  end
+
+  def test_link_endpoint_returns_start_url_for_github
+    with_auth_config(auth_method: :database, oauth_providers: oauth_provider_config_stub, oauth_enabled: true) do
+      user = FactoryBot.create(:user)
+      add_auth_header_for(user: user)
+      header 'Host', 'localhost'
+
+      post_json '/api/auth/oauth/github/link', {}
+
+      assert_includes [200, 201], last_response.status
+      body = last_response_body
+
+      assert_match(%r{^/api/auth/oauth/github/start\?oauth_state_token=}, body['redirect_to'])
+    ensure
+      clear_auth_header
       header 'Host', nil
     end
   end

@@ -51,7 +51,7 @@ module Api
 
     def callback
       provider_key = params[:provider].to_s
-      state_token = params[:state].to_s
+      state_token = extract_state_token
       auth_hash = request.env['omniauth.auth']
 
       state = OauthState.find_by(token: state_token, provider: provider_key)
@@ -83,10 +83,10 @@ module Api
 
       redirect_to next_location
     rescue Oauth::IdentityResolver::ResolutionError => e
-      logger.warn("[OAuth] identity resolution failed provider=#{params[:provider]} state=#{params[:state]} code=#{e.code} message=#{e.message}")
+      logger.warn("[OAuth] identity resolution failed provider=#{params[:provider]} state=#{state_token} code=#{e.code} message=#{e.message}")
       redirect_to failure_redirect_url(params[:provider], e.code)
     rescue StandardError => e
-      logger.error("[OAuth] callback processing failed provider=#{params[:provider]} error=#{e.class.name} message=#{e.message}")
+      logger.error("[OAuth] callback processing failed provider=#{params[:provider]} state=#{state_token} error=#{e.class.name} message=#{e.message}")
       redirect_to failure_redirect_url(params[:provider], 'unexpected_error')
     ensure
       OauthState.cleanup_expired!
@@ -160,9 +160,22 @@ module Api
     end
 
     def start_redirect_url(provider_key, state)
-      query_string = { state: state.token }.to_query
+      query_string = { oauth_state_token: state.token }.to_query
       path = "/api/auth/oauth/#{provider_key}"
       query_string.present? ? "#{path}?#{query_string}" : path
+    end
+
+    def extract_state_token
+      stored_params = request.env['omniauth.params']
+
+      from_env = if stored_params.respond_to?(:with_indifferent_access)
+                   stored_params.with_indifferent_access['oauth_state_token']
+                 elsif stored_params.is_a?(Hash)
+                   stored_params['oauth_state_token'] || stored_params[:oauth_state_token]
+                 end
+
+      token = from_env.presence || params[:oauth_state_token].presence || params[:state].presence
+      token.to_s
     end
 
     def state_expired?(state)

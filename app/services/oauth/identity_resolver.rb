@@ -75,17 +75,25 @@ module Oauth
     end
 
     def extra_raw_info
-      extra = auth_hash['extra'] || auth_hash[:extra] || {}
-      raw_info = extra.respond_to?(:[]) ? (extra['raw_info'] || extra[:raw_info] || {}) : {}
+      raw_info = extra_context['raw_info'] || {}
       raw_info.is_a?(Hash) ? raw_info.with_indifferent_access : raw_info
     end
 
     def verified_email
-      info['email'] if truthy?(info['email_verified'])
+      return info['email'] if truthy?(info['email_verified'])
+
+      primary_entry = primary_email_entry
+      return primary_entry[:email] if primary_entry && truthy?(primary_entry[:verified])
+
+      if provider == 'github' && info['email'].present?
+        return info['email']
+      end
+
+      nil
     end
 
     def primary_email
-      info['email'] || extra_raw_info['email']
+      info['email'].presence || extra_raw_info['email'].presence || primary_email_entry&.dig(:email)
     end
 
     def existing_identity
@@ -169,7 +177,10 @@ module Oauth
     end
 
     def merged_raw_info
-      extra_raw_info.merge(info) { |_, old, new| old.presence || new }
+      enriched = extra_raw_info.merge(info) { |_, old, new| old.presence || new }
+      emails = Array(extra_all_emails)
+      enriched['emails'] = emails if emails.present?
+      enriched
     end
 
     def update_existing_identity!
@@ -187,6 +198,28 @@ module Oauth
       return unless conflict && !linking_same_user?(conflict)
 
       raise ResolutionError.new('OAuth identity already linked to another user.', code: 'identity_claimed')
+    end
+
+    def extra_context
+      @extra_context ||= begin
+        raw = auth_hash['extra'] || auth_hash[:extra] || {}
+        raw.is_a?(Hash) ? raw.with_indifferent_access : {}
+      end
+    end
+
+    def extra_all_emails
+      emails = extra_context[:all_emails]
+      return [] unless emails.respond_to?(:map)
+
+      emails.map do |entry|
+        entry.is_a?(Hash) ? entry.with_indifferent_access : nil
+      end.compact
+    end
+
+    def primary_email_entry
+      emails = extra_all_emails
+      primary = emails.find { |entry| truthy?(entry[:primary]) }
+      primary || emails.first
     end
 
     def linking_same_user?(identity)

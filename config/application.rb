@@ -143,10 +143,29 @@ module Doubtfire
             access_type: ENV['DF_OAUTH_GOOGLE_ACCESS_TYPE'],
             prompt: ENV['DF_OAUTH_GOOGLE_PROMPT'],
             hosted_domain: ENV['DF_OAUTH_GOOGLE_HOSTED_DOMAIN'],
-            icon: ENV['DF_OAUTH_GOOGLE_ICON'] || 'google'
+            icon: ENV['DF_OAUTH_GOOGLE_ICON'] || 'google',
+            priority: ENV['DF_OAUTH_GOOGLE_PRIORITY']&.to_i
           }.with_indifferent_access
         else
           warn '[OAuth] Google provider configured but missing DF_OAUTH_GOOGLE_CLIENT_ID, DF_OAUTH_GOOGLE_CLIENT_SECRET, or DF_OAUTH_GOOGLE_REDIRECT_URI environment variables.'
+        end
+      when 'github'
+        client_id = ENV['DF_OAUTH_GITHUB_CLIENT_ID']
+        client_secret = ENV['DF_OAUTH_GITHUB_CLIENT_SECRET']
+        redirect_uri = ENV['DF_OAUTH_GITHUB_REDIRECT_URI']
+
+        if client_id.present? && client_secret.present? && redirect_uri.present?
+          config.oauth_providers[:github] = {
+            name: ENV.fetch('DF_OAUTH_GITHUB_DISPLAY_NAME', 'GitHub'),
+            client_id: client_id,
+            client_secret: client_secret,
+            scope: ENV.fetch('DF_OAUTH_GITHUB_SCOPE', 'read:user,user:email'),
+            redirect_uri: redirect_uri,
+            icon: ENV['DF_OAUTH_GITHUB_ICON'] || 'github',
+            priority: ENV['DF_OAUTH_GITHUB_PRIORITY']&.to_i
+          }.with_indifferent_access
+        else
+          warn '[OAuth] GitHub provider configured but missing DF_OAUTH_GITHUB_CLIENT_ID, DF_OAUTH_GITHUB_CLIENT_SECRET, or DF_OAUTH_GITHUB_REDIRECT_URI environment variables.'
         end
       else
         warn "[OAuth] Unsupported provider configured: #{provider_key}"
