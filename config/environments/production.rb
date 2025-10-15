@@ -42,8 +42,8 @@ Doubtfire::Application.configure do
       domain: ENV.fetch('DF_SMTP_DOMAIN', nil),
       user_name: ENV.fetch('DF_SMTP_USERNAME', nil),
       password: ENV.fetch('DF_SMTP_PASSWORD', nil),
-      authentication: ENV.fetch('DF_SMTP_AUTHENTICATION', 'plain'),
-      enable_starttls_auto: true
+      authentication: ENV.fetch('DF_SMTP_AUTH', ENV.fetch('DF_SMTP_AUTHENTICATION', 'plain')),
+      enable_starttls_auto: ENV.fetch('DF_SMTP_ENABLE_STARTTLS', 'true') != 'false'
     }
   end
 

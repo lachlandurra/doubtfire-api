@@ -23,10 +23,23 @@ Doubtfire::Application.configure do
   # Disable request forgery protection in test environment
   config.action_controller.allow_forgery_protection = false
 
-  # Tell Action Mailer not to deliver emails to the real world.
-  # The :test delivery method accumulates sent emails in the
-  # ActionMailer::Base.deliveries array.
-  config.action_mailer.delivery_method = :test
+  # Tests can exercise SMTP-specific code paths by toggling delivery method via env vars.
+  delivery_method = (ENV['DF_MAIL_DELIVERY_METHOD'] || 'test').to_sym
+  config.action_mailer.delivery_method = delivery_method
+  config.action_mailer.perform_deliveries = delivery_method != :test
+
+  if delivery_method == :smtp
+    # Reuse the same SMTP shape as production so behaviour stays consistent.
+    config.action_mailer.smtp_settings = {
+      address: ENV.fetch('DF_SMTP_ADDRESS', 'localhost'),
+      port: ENV.fetch('DF_SMTP_PORT', 25),
+      domain: ENV.fetch('DF_SMTP_DOMAIN', nil),
+      user_name: ENV.fetch('DF_SMTP_USERNAME', nil),
+      password: ENV.fetch('DF_SMTP_PASSWORD', nil),
+      authentication: ENV.fetch('DF_SMTP_AUTH', ENV.fetch('DF_SMTP_AUTHENTICATION', 'plain')),
+      enable_starttls_auto: ENV.fetch('DF_SMTP_ENABLE_STARTTLS', 'true') != 'false'
+    }
+  end
 
   # Print deprecation notices to the stderr
   config.active_support.deprecation = :stderr

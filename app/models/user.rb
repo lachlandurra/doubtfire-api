@@ -19,6 +19,8 @@ class User < ApplicationRecord
 
   include UserTiiModule
 
+  EMAIL_REGEX = /\A([^@\s]+)@((?:[-a-z0-9]+\.)+[a-z]{2,})\z/i
+
   ###
   # Authentication
   ###
@@ -92,19 +94,20 @@ class User < ApplicationRecord
   # Force-generates a new authentication token, regardless of whether or not
   # it is actually expired
   #
-  def generate_authentication_token!(remember = false)
+  def generate_authentication_token!(remember = false, expiry: nil, token_type: :general)
     # Ensure this user is saved... so it has an id
     self.save unless self.persisted?
-    AuthToken.generate(self, remember)
+    expiry_time = expiry || Time.zone.now + 2.hours
+    AuthToken.generate(self, remember, expiry_time, token_type: token_type)
   end
 
   #
   # Generate an authentication token that will expire in 30 seconds
   #
-  def generate_temporary_authentication_token!
+  def generate_temporary_authentication_token!(token_type: :login, expires_in: 30.seconds)
     # Ensure this user is saved... so it has an id
     self.save unless self.persisted?
-    AuthToken.generate(self, false, Time.zone.now + 30.seconds)
+    AuthToken.generate(self, false, Time.zone.now + expires_in, token_type: token_type)
   end
 
   #
@@ -117,8 +120,14 @@ class User < ApplicationRecord
   #
   # Returns authentication of the user
   #
-  def token_for_text?(a_token)
-    self.auth_tokens.each do |token|
+  def token_for_text?(a_token, token_type = nil)
+    scope = self.auth_tokens
+    if token_type.present?
+      enum_value = AuthToken.token_types[token_type]
+      scope = scope.where(token_type: enum_value)
+    end
+
+    scope.each do |token|
       if a_token == token.authentication_token
         return token
       end
@@ -135,14 +144,21 @@ class User < ApplicationRecord
   has_many    :unit_roles, dependent: :destroy
   has_many    :projects, dependent: :destroy
   has_many    :auth_tokens, dependent: :destroy
+  has_many    :magic_link_requests, dependent: :destroy, inverse_of: :user
   has_one     :webcal, dependent: :destroy
+
+  before_validation :normalise_personal_email
 
   # Model validations/constraints
   validates :first_name,  presence: true
   validates :last_name,   presence: true
   validates :role_id,     presence: true
   validates :username,    presence: true, uniqueness: { case_sensitive: false }
-  validates :email,       presence: true, uniqueness: { case_sensitive: false }, format: { with: /\A([^@\s]+)@((?:[-a-z0-9]+\.)+[a-z]{2,})\z/i }
+  validates :email,       presence: true, uniqueness: { case_sensitive: false }, format: { with: EMAIL_REGEX }
+  validates :personal_email,
+            uniqueness: { case_sensitive: false },
+            allow_blank: true,
+            format: { with: EMAIL_REGEX }
   validates :student_id,  uniqueness: true, allow_nil: true
   validate :can_change_to_role?, if: :will_save_change_to_role_id?
 
@@ -154,6 +170,13 @@ class User < ApplicationRecord
 
   def self.teaching(unit)
     User.joins(:unit_roles).where('unit_roles.unit_id = :unit_id and ( unit_roles.role_id = :tutor_role_id or unit_roles.role_id = :convenor_role_id) ', unit_id: unit.id, tutor_role_id: Role.tutor_id, convenor_role_id: Role.convenor_id)
+  end
+
+  def self.find_by_personal_email(value)
+    email = value.to_s.strip.downcase
+    return nil if email.blank?
+
+    where('LOWER(personal_email) = ?', email).first
   end
 
   # def username=(name)
@@ -518,5 +541,15 @@ class User < ApplicationRecord
       ignored: ignored,
       errors: errors
     }
+  end
+
+  def personal_email_verified?
+    personal_email_verified_at.present?
+  end
+
+  private
+
+  def normalise_personal_email
+    self.personal_email = personal_email.to_s.downcase.strip if personal_email.present?
   end
 end

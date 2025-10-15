@@ -2,6 +2,7 @@ require 'grape'
 require 'json/jwt'
 require 'onelogin/ruby-saml'
 require 'entities/user_entity'
+require 'uri'
 
 #
 # Provides the authentication API for Doubtfire.
@@ -11,67 +12,124 @@ require 'entities/user_entity'
 class AuthenticationApi < Grape::API
   helpers LogHelper
   helpers AuthenticationHelpers
+  helpers do
+    # Guard endpoint access when magic link feature is disabled.
+    def ensure_magic_link_available!
+      error!({ error: 'Magic link authentication is not configured.' }, 404) unless magic_link_enabled?
+    end
+
+    # Restrict redirect targets to known hosts or relative paths.
+    def sanitise_redirect_path(raw)
+      return nil if raw.blank?
+
+      uri = URI.parse(raw)
+      if uri.host.present?
+        return raw if magic_link_allowed_host?(uri)
+
+        return nil
+      end
+
+      raw.starts_with?('/') ? raw : "/#{raw}"
+    rescue URI::InvalidURIError
+      nil
+    end
+
+    # Ensure callback hosts match the configured allowlist.
+    def magic_link_allowed_host?(uri)
+      allowed = Doubtfire::Application.config.magic_link_allowed_callback_hosts
+      return true if allowed.blank?
+
+      host = uri.host
+      return false if host.blank?
+
+      host_with_port = uri.port ? "#{host}:#{uri.port}" : host
+      allowed.include?(host_with_port) || allowed.include?(host)
+    end
+
+    # Cached magic link service configuration.
+    def magic_link_service_config
+      Doubtfire::Application.config.magic_link_config
+    end
+  end
 
   #
   # Sign in - only mounted if AAF auth is NOT used
   #
-  if !AuthenticationHelpers.aaf_auth? && !AuthenticationHelpers.saml_auth?
+  if AuthenticationHelpers.db_auth? || AuthenticationHelpers.ldap_auth?
     desc 'Sign in'
     params do
       requires :username, type: String, desc: 'User username'
-      requires :password, type: String, desc: 'User\'s password'
+      optional :password, type: String, desc: 'User\'s password'
+      optional :auth_token, type: String, desc: 'Temporary authentication token for passwordless flows'
       optional :remember, type: Boolean, desc: 'User has requested to remember login', default: false
     end
     post '/auth' do
       username = params[:username]
+      auth_token_param = params[:auth_token].presence
       password = params[:password]
       remember = params[:remember]
       logger.info "Authenticate #{username} from #{request.ip}"
 
-      # Truncate the 's' from sXXX for Swinburne auth
-      truncate_s_match = (username =~ /^[Ss]\d{6,10}([Xx]|\d)$/)
-      username[0] = '' if !truncate_s_match.nil? && truncate_s_match.zero?
-
-      # No provided credentials
-      if username.nil? || password.nil?
-        error!({ error: 'The request must contain the user username and password.' }, 400)
-      end
-
-      # User lookup
+      # Normalise username for lookup
       username = username.downcase
       institution_email_domain = Doubtfire::Application.config.institution[:email_domain]
-      user = User.find_or_create_by(username: username) do |new_user|
-        new_user.first_name = 'First Name'
-        new_user.last_name  = 'Surname'
-        new_user.email      = "#{username}@#{institution_email_domain}"
-        new_user.nickname   = 'Nickname'
-        new_user.role_id    = Role.student.id
-        new_user.login_id   = username
-      end
+      user = User.find_by('LOWER(username) = ?', username)
 
-      # Try to authenticate
-      unless user.authenticate?(password)
-        error!({ error: 'Invalid email or password.' }, 401)
-        return
-      end
+      if auth_token_param.present?
+        error!({ error: 'Username is required for token exchange.' }, 400) if username.blank?
+        error!({ error: 'Account not found.' }, 404) if user.nil?
 
-      # Create user if they are a new record
-      if user.new_record?
-        user.encrypted_password = BCrypt::Password.create('password')
+        token = user.token_for_text?(auth_token_param)
+        error!({ error: 'Invalid token.' }, 404) if token.nil?
 
-        unless user.valid?
-          error!(error: 'There was an error creating your account in Doubtfire. ' \
-                        'Please get in contact with your unit convenor or the ' \
-                        'Doubtfire administrators.')
+        token.destroy!
+        session_token = user.generate_authentication_token!(remember)
+
+        logger.info "Token login #{username} from #{request.ip}"
+
+        present :user, user, with: Entities::UserEntity
+        present :auth_token, session_token.authentication_token
+      else
+        password = password.to_s
+
+        # Truncate the 's' from sXXX for Swinburne auth
+        truncate_s_match = (username =~ /^[Ss]\d{6,10}([Xx]|\d)$/)
+        username = username[1..] if !truncate_s_match.nil? && truncate_s_match.zero?
+
+        if username.blank? || password.blank?
+          error!({ error: 'The request must contain the user username and password.' }, 400)
         end
-        user.save
+
+        # User lookup or creation
+        user ||= User.find_or_create_by(username: username) do |new_user|
+          new_user.first_name = 'First Name'
+          new_user.last_name  = 'Surname'
+          new_user.email      = "#{username}@#{institution_email_domain}"
+          new_user.nickname   = 'Nickname'
+          new_user.role_id    = Role.student.id
+          new_user.login_id   = username
+        end
+
+        unless user.authenticate?(password)
+          error!({ error: 'Invalid email or password.' }, 401)
+        end
+
+        if user.new_record?
+          user.encrypted_password = BCrypt::Password.create('password')
+
+          unless user.valid?
+            error!(error: 'There was an error creating your account in Doubtfire. ' \
+                          'Please get in contact with your unit convenor or the ' \
+                          'Doubtfire administrators.')
+          end
+          user.save
+        end
+
+        logger.info "Login #{username} from #{request.ip}"
+
+        present :user, user, with: Entities::UserEntity
+        present :auth_token, user.generate_authentication_token!(remember).authentication_token
       end
-
-      logger.info "Login #{username} from #{request.ip}"
-
-      # Return user details
-      present :user, user, with: Entities::UserEntity
-      present :auth_token, user.generate_authentication_token!(remember).authentication_token
     end
   end
 
@@ -274,6 +332,166 @@ class AuthenticationApi < Grape::API
         request = OneLogin::RubySaml::Authrequest.new
         request.create(AuthenticationHelpers.saml_settings)
       end
+    if magic_link_enabled?
+      config = magic_link_config
+      auto_provision_enabled = !!config[:auto_provision]
+      response[:magic_link_enabled] = true
+      response[:magic_link] = {
+        token_ttl_seconds: config[:token_ttl_seconds],
+        resend_window_seconds: config[:resend_window_seconds],
+        max_attempts: config[:max_attempts],
+        callback_url: config[:callback_url],
+        default_redirect_path: config[:default_redirect_path],
+        support_email: config[:support_email],
+        allowed_callback_hosts: Doubtfire::Application.config.magic_link_allowed_callback_hosts,
+        auto_provision: auto_provision_enabled,
+        requires_personal_email: !auto_provision_enabled
+      }.delete_if { |_, value| value.nil? }
+    end
+    present response, with: Grape::Presenters::Presenter
+  end
+
+  #
+  # Issues a single-use login link and schedules the notification email
+  #
+  desc 'Request an email magic link'
+  params do
+    requires :email, type: String, desc: 'Email address to send the magic link to'
+    optional :redirect_path, type: String, desc: 'Optional SPA path to redirect to after login'
+    optional :purpose, type: String, desc: 'Purpose for the magic link', default: MagicLinkRequest::PURPOSE_LOGIN
+  end
+  post '/auth/magic-link' do
+    ensure_magic_link_available!
+
+    email_param = params[:email].to_s
+    redirect_path = sanitise_redirect_path(params[:redirect_path])
+    purpose = params[:purpose].presence || MagicLinkRequest::PURPOSE_LOGIN
+
+    issuer_result = MagicLinks::Issuer.call(
+      email: email_param,
+      request_ip: request.ip,
+      user_agent: request.user_agent,
+      redirect_path: redirect_path,
+      purpose: purpose,
+      config: magic_link_service_config
+    )
+
+    logger.info "[MagicLink] issued request_id=#{issuer_result.request.id} email=#{issuer_result.request.email} user_id=#{issuer_result.user&.id} ip=#{request.ip}"
+
+    notification_payload = {
+      request_id: issuer_result.request.id,
+      email: issuer_result.request.email,
+      user_id: issuer_result.user&.id,
+      purpose: issuer_result.request.purpose
+    }
+
+    ActiveSupport::Notifications.instrument('magic_link.sent', notification_payload) do
+      MagicLinkMailer.login_link(issuer_result.request, raw_token: issuer_result.raw_token).deliver_later
+    end
+
+    status 202
+    present(
+      {
+        status: 'sent',
+        magic_link_status: 'pending',
+        expires_at: issuer_result.request.expires_at.iso8601,
+        cooldown_seconds: issuer_result.cooldown_seconds
+      },
+      with: Grape::Presenters::Presenter
+    )
+  rescue MagicLinks::Issuer::RateLimitedError => e
+    headers['Retry-After'] = e.retry_after.to_s if e.retry_after
+    logger.warn "[MagicLink] rate_limited email=#{email_param.downcase} ip=#{request.ip} retry_after=#{e.retry_after}"
+    error!({ error: 'Magic link requests are temporarily limited. Please try again later.', code: e.code, retry_after: e.retry_after }, 429)
+  rescue MagicLinks::Issuer::Error => e
+    logger.warn "[MagicLink] issuer_error code=#{e.code} email=#{email_param.downcase} message=#{e.message}"
+    error!({ error: e.message, code: e.code }, 400)
+  rescue ActiveRecord::RecordInvalid => e
+    logger.error "[MagicLink] issuer_invalid email=#{email_param.downcase} errors=#{e.record.errors.full_messages.join(', ')}"
+    error!({ error: 'Unable to create magic link request.', code: 'validation_error' }, 422)
+  end
+
+  #
+  # Validates a magic link token and returns an auth token for the SPA
+  #
+  desc 'Consume an email magic link'
+  params do
+    requires :token, type: String, desc: 'Magic link token'
+  end
+  post '/auth/magic-link/consume' do
+    ensure_magic_link_available!
+
+    token_param = params[:token].to_s
+    token_digest = token_param.present? ? MagicLinkRequest.digest_for(token_param) : nil
+
+    verifier_result = MagicLinks::Verifier.call(
+      token: token_param,
+      request_ip: request.ip,
+      user_agent: request.user_agent,
+      config: magic_link_service_config
+    )
+
+    logger.info "[MagicLink] consumed request_id=#{verifier_result.request.id} user_id=#{verifier_result.user.id} ip=#{request.ip}"
+
+    auth_token = verifier_result.auth_token
+    response = {
+      auth_token: auth_token.authentication_token,
+      username: verifier_result.user.username,
+      expires_at: auth_token.auth_token_expiry&.iso8601,
+      magic_link_status: verifier_result.status,
+      new_user: verifier_result.new_user
+    }
+    response[:redirect_path] = verifier_result.redirect_path if verifier_result.redirect_path.present?
+
+    present response, with: Grape::Presenters::Presenter
+  rescue MagicLinks::Verifier::ExpiredError => e
+    logger.warn "[MagicLink] expired token_digest=#{token_digest} ip=#{request.ip}"
+    error!({ error: e.message, code: e.code }, 410)
+  rescue MagicLinks::Verifier::AlreadyUsedError => e
+    logger.warn "[MagicLink] already_used token_digest=#{token_digest} ip=#{request.ip}"
+    error!({ error: e.message, code: e.code }, 409)
+  rescue MagicLinks::Verifier::UserNotFoundError => e
+    logger.warn "[MagicLink] user_not_found token_digest=#{token_digest} ip=#{request.ip}"
+    error!({ error: e.message, code: e.code }, 404)
+  rescue MagicLinks::Verifier::NotFoundError => e
+    logger.warn "[MagicLink] not_found token_digest=#{token_digest} ip=#{request.ip}"
+    error!({ error: e.message, code: e.code }, 404)
+  rescue MagicLinks::Verifier::Error => e
+    logger.error "[MagicLink] verifier_error code=#{e.code} token_digest=#{token_digest}"
+    error!({ error: e.message, code: e.code }, 400)
+  rescue ActiveRecord::RecordInvalid => e
+    logger.error "[MagicLink] verifier_invalid token_digest=#{token_digest} errors=#{e.record.errors.full_messages.join(', ')}"
+    error!({ error: 'Unable to consume magic link.', code: 'validation_error' }, 422)
+  end
+
+  #
+  # Poll for the current status of a pending magic link
+  #
+  desc 'Magic link status lookup'
+  params do
+    requires :token, type: String, desc: 'Magic link token'
+  end
+  get '/auth/magic-link/status' do
+    ensure_magic_link_available!
+
+    token_param = params[:token].to_s
+    token_digest = token_param.present? ? MagicLinkRequest.digest_for(token_param) : nil
+    request_record = token_digest.present? ? MagicLinkRequest.find_by(token_digest: token_digest) : nil
+
+    status_value =
+      if request_record.nil?
+        'invalid'
+      elsif request_record.consumed_at?
+        'consumed'
+      elsif request_record.expired?
+        'expired'
+      else
+        'pending'
+      end
+
+    response = { status: status_value }
+    response[:expires_at] = request_record.expires_at.iso8601 if request_record&.expires_at
+
     present response, with: Grape::Presenters::Presenter
   end
 

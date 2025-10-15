@@ -53,14 +53,30 @@ Doubtfire::Application.configure do
   # Store uploaded files on the local file system (see config/storage.yml for options).
   # config.active_storage.service = :local
 
-  # Don't care if the mailer can't send.
-  config.action_mailer.raise_delivery_errors = false
-
   config.action_mailer.perform_caching = false
 
-  # Tell Action Mailer not to deliver emails to the real world.
-  # Write them to file instead (under doubtfire-api/tmp/mails)
-  config.action_mailer.delivery_method = :file
+  # Allow developers to switch delivery strategies via env vars without code changes.
+  delivery_method = (ENV['DF_MAIL_DELIVERY_METHOD'] || 'file').to_sym
+  config.action_mailer.delivery_method = delivery_method
+  default_perform = delivery_method == :test ? 'no' : 'yes'
+  config.action_mailer.perform_deliveries = (ENV['DF_MAIL_PERFORM_DELIVERIES'] || default_perform) == 'yes'
+  config.action_mailer.raise_delivery_errors = delivery_method == :smtp
+
+  if delivery_method == :smtp
+    # Mirror production SMTP settings so magic-link flows can be exercised end-to-end.
+    config.action_mailer.smtp_settings = {
+      address: ENV.fetch('DF_SMTP_ADDRESS', 'localhost'),
+      port: ENV.fetch('DF_SMTP_PORT', 25),
+      domain: ENV.fetch('DF_SMTP_DOMAIN', nil),
+      user_name: ENV.fetch('DF_SMTP_USERNAME', nil),
+      password: ENV.fetch('DF_SMTP_PASSWORD', nil),
+      authentication: ENV.fetch('DF_SMTP_AUTH', ENV.fetch('DF_SMTP_AUTHENTICATION', 'plain')),
+      enable_starttls_auto: ENV.fetch('DF_SMTP_ENABLE_STARTTLS', 'true') != 'false'
+    }
+  elsif delivery_method == :file
+    # When not using SMTP, write emails to tmp/mails for quick inspection.
+    config.action_mailer.file_settings = { location: Rails.root.join('tmp/mails') }
+  end
 
   # Print deprecation notices to the Rails logger.
   config.active_support.deprecation = :log

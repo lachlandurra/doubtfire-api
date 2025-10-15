@@ -56,6 +56,10 @@ module AuthenticationHelpers
     User.eager_load(:role, :auth_tokens).find_by_username(username)
   end
 
+  def auth_method_parts
+    Doubtfire::Application.config.auth_method.to_s.split('_')
+  end
+
   #
   # Add the required auth_token to each of the routes for the provided
   # Grape::API.
@@ -108,27 +112,46 @@ module AuthenticationHelpers
   # Returns true if using SAML2.0 auth strategy
   #
   def saml_auth?
-    Doubtfire::Application.config.auth_method == :saml
+    auth_method_parts.include?('saml')
   end
 
   #
   # Returns true if using AAF devise auth strategy
   #
   def aaf_auth?
-    Doubtfire::Application.config.auth_method == :aaf
+    auth_method_parts.include?('aaf')
   end
 
   #
   # Returns true if using LDAP devise auth strategy
   #
   def ldap_auth?
-    Doubtfire::Application.config.auth_method == :ldap
+    auth_method_parts.include?('ldap')
   end
 
   #
   # Returns true if using database devise auth strategy
   #
   def db_auth?
-    Doubtfire::Application.config.auth_method == :database
+    auth_method_parts.include?('database')
+  end
+
+  def magic_link_auth?
+    parts = auth_method_parts
+    parts.include?('magic') && parts.include?('link')
+  end
+
+  #
+  # Returns true when magic links are globally enabled in configuration.
+  #
+  def magic_link_enabled?
+    Doubtfire::Application.config.magic_link_enabled?
+  end
+
+  #
+  # Provides readonly access to the configured magic link options.
+  #
+  def magic_link_config
+    Doubtfire::Application.config.magic_link_config
   end
 end

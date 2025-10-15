@@ -25,6 +25,63 @@ module Doubtfire
     # environment variable.
     config.auth_method = (ENV['DF_AUTH_METHOD'] || :database).to_sym
 
+    # ==> Magic link configuration
+    # Configure the passwordless login feature and expose helpers for the rest of the app.
+    config.magic_link = ActiveSupport::OrderedOptions.new
+
+    magic_link_enabled_env = ENV['DF_MAGIC_LINK_ENABLED']
+    config.magic_link.enabled =
+      if magic_link_enabled_env.nil?
+        false
+      else
+        %w[true 1 yes y].include?(magic_link_enabled_env.to_s.strip.downcase)
+      end
+
+    token_ttl_env = ENV['DF_MAGIC_LINK_TOKEN_TTL']
+    config.magic_link.token_ttl_seconds = token_ttl_env.present? ? token_ttl_env.to_i : 15.minutes.to_i
+
+    resend_window_env = ENV['DF_MAGIC_LINK_RESEND_WINDOW']
+    config.magic_link.resend_window_seconds = resend_window_env.present? ? resend_window_env.to_i : 2.minutes.to_i
+
+    max_attempts_env = ENV['DF_MAGIC_LINK_MAX_ATTEMPTS']
+    config.magic_link.max_attempts = max_attempts_env.present? ? max_attempts_env.to_i : 3
+
+    config.magic_link.from_email = ENV['DF_MAGIC_LINK_FROM_EMAIL']
+    config.magic_link.subject = ENV['DF_MAGIC_LINK_SUBJECT'] || 'Your OnTrack magic link'
+    config.magic_link.callback_url = ENV['DF_MAGIC_LINK_CALLBACK_URL']
+    config.magic_link.default_redirect_path = ENV['DF_MAGIC_LINK_DEFAULT_REDIRECT_PATH']
+
+    allowed_hosts_env = ENV['DF_MAGIC_LINK_ALLOWED_CALLBACK_HOSTS']
+    config.magic_link.allowed_callback_hosts =
+      if allowed_hosts_env.present?
+        allowed_hosts_env.split(',').map(&:strip).reject(&:blank?)
+      else
+        []
+      end
+
+    auto_provision_env = ENV['DF_MAGIC_LINK_AUTO_PROVISION']
+    config.magic_link.auto_provision =
+      if auto_provision_env.nil?
+        false
+      else
+        %w[true 1 yes y].include?(auto_provision_env.to_s.strip.downcase)
+      end
+
+    config.magic_link.support_email = ENV['DF_MAGIC_LINK_SUPPORT_EMAIL']
+
+    # Helper accessors mirror the pattern used elsewhere in the config and simplify lookups.
+    config.singleton_class.send(:define_method, :magic_link_enabled?) do
+      magic_link.present? && !!magic_link[:enabled]
+    end
+
+    config.singleton_class.send(:define_method, :magic_link_config) do
+      magic_link || ActiveSupport::OrderedOptions.new
+    end
+
+    config.singleton_class.send(:define_method, :magic_link_allowed_callback_hosts) do
+      Array(magic_link&.[](:allowed_callback_hosts))
+    end
+
     # ==> Student work directory
     # File server location for storing student's work. Defaults to `student_work`
     # directory under root but is overridden using DF_STUDENT_WORK_DIR environment
