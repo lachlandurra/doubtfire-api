@@ -86,11 +86,18 @@ class AuthenticationApi < Grape::API
       requires :SAMLResponse, type: String, desc: 'Data provided for further processing.'
     end
     post '/auth/jwt' do
-      response = OneLogin::RubySaml::Response.new(params[:SAMLResponse], allowed_clock_drift: 1.second,
-                                                                         settings: AuthenticationHelpers.saml_settings)
+      response = OneLogin::RubySaml::Response.new(
+        params[:SAMLResponse],
+        allowed_clock_drift: (Rails.env.development? ? 60.seconds : 1.second),
+        settings: AuthenticationHelpers.saml_settings
+      )
 
       # We validate the SAML Response and check if the user already exists in the system
-      return error!({ error: 'Invalid SAML response.' }, 401) unless response.is_valid?
+      unless response.is_valid?
+        dev_details = Rails.env.development? ? { details: response.errors } : {}
+        logger.error "SAML validation failed: #{response.errors.inspect}"
+        return error!({ error: 'Invalid SAML response.' }.merge(dev_details), 401)
+      end
 
       attributes = response.attributes
 
