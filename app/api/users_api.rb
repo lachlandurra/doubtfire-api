@@ -219,6 +219,60 @@ class UsersApi < Grape::API
     User.import_from_csv(current_user, File.new(path))
   end
 
+  # =========================================================================
+  # Linked logins — Google account linking management
+  # =========================================================================
+
+  desc 'Get linked external logins for a user'
+  params do
+    requires :id, type: Integer, desc: 'User ID'
+  end
+  get '/users/:id/linked_logins' do
+    authenticated?(:general)
+
+    target_user = User.find_by(id: params[:id])
+    error!({ error: 'User not found.' }, 404) if target_user.nil?
+
+    unless current_user.id == target_user.id || authorise?(current_user, User, :admin_units)
+      error!({ error: 'Not authorised to view linked logins for this user.' }, 403)
+    end
+
+    target_user.linked_logins.map do |ll|
+      { provider: ll.provider, provider_identifier: ll.provider_identifier, created_at: ll.created_at }
+    end
+  end
+
+  desc 'Unlink an external login from a user'
+  params do
+    requires :id,       type: Integer, desc: 'User ID'
+    requires :provider, type: String,  desc: 'Provider name (e.g. google)'
+  end
+  delete '/users/:id/linked_logins/:provider' do
+    authenticated?(:general)
+
+    target_user = User.find_by(id: params[:id])
+    error!({ error: 'User not found.' }, 404) if target_user.nil?
+
+    unless current_user.id == target_user.id
+      error!({ error: 'Not authorised to unlink logins for this user.' }, 403)
+    end
+
+    # For AAF/SAML, login_id is the institutional identity — if that's blank and Google
+    # is the only linked login, removing it would lock the user out entirely.
+    # For database auth, users always have a password fallback so this guard is skipped.
+    if AuthenticationHelpers.aaf_auth? || AuthenticationHelpers.saml_auth?
+      if target_user.login_id.blank? && target_user.linked_logins.count <= 1
+        error!({ error: 'Cannot unlink the only login method for this account.' }, 422)
+      end
+    end
+
+    linked = target_user.linked_logins.find_by(provider: params[:provider])
+    error!({ error: 'Linked login not found.' }, 404) if linked.nil?
+
+    linked.destroy!
+    present nil
+  end
+
   desc 'Download CSV of all users'
   get '/csv/users' do
     unless authorise? current_user, User, :download_system_csv

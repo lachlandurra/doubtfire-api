@@ -99,6 +99,11 @@ module Doubtfire
         config.saml[:idp_name_identifier_format] = ENV['DF_SAML_IDP_SAML_NAME_IDENTIFIER_FORMAT'] || "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
       end
 
+      # Optional: additional identity broker buttons (e.g. Keycloak social login).
+      # Format: comma-separated "kc_idp_hint:Display Name" pairs.
+      # Example: "google:Google,github:GitHub"
+      config.saml[:idp_providers] = ENV.fetch('DF_SAML_IDP_PROVIDERS', nil)
+
       # Check we have all values
       # always need:
       if config.saml[:assertion_consumer_service_url].nil? ||
@@ -154,6 +159,18 @@ module Doubtfire
               "DF_SECRET_KEY_AAF            => #{!credentials.secret_key_aaf.nil?}\n"
       end
     end
+    # ==> Keycloak OIDC — Google account linking (independent of auth_method)
+    if ENV['DF_KEYCLOAK_URL'].present?
+      config.keycloak = HashWithIndifferentAccess.new
+      config.keycloak[:url]             = ENV['DF_KEYCLOAK_URL']
+      config.keycloak[:public_url]      = ENV.fetch('DF_KEYCLOAK_PUBLIC_URL', ENV['DF_KEYCLOAK_URL'])
+      config.keycloak[:realm]           = ENV.fetch('DF_KEYCLOAK_REALM', 'doubtfire')
+      config.keycloak[:client_id]       = ENV.fetch('DF_KEYCLOAK_CLIENT_ID', nil)
+      config.keycloak[:client_secret]   = ENV.fetch('DF_KEYCLOAK_CLIENT_SECRET', nil)
+      config.keycloak[:link_callback]   = ENV.fetch('DF_KEYCLOAK_LINK_CALLBACK', nil)
+      config.keycloak[:signin_callback] = ENV.fetch('DF_KEYCLOAK_SIGNIN_CALLBACK', nil)
+    end
+
     # Check secrets set for DF_SECRET_KEY_BASE, DF_SECRET_KEY_ATTR, DF_SECRET_KEY_DEVISE
     if credentials.secret_key_base.nil? ||
        credentials.secret_key_attr.nil? ||

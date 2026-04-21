@@ -1,11 +1,11 @@
 class ChangeTeamMembershipIdToUnitRoleId < ActiveRecord::Migration[4.2]
   def change
-    rename_column :projects, :team_membership_id, :unit_role_id
+    rename_column :projects, :team_membership_id, :unit_role_id if column_exists?(:projects, :team_membership_id)
 
-    rename_index :projects, "index_projects_on_team_membership_id", "index_projects_on_unit_role_id"
+    rename_index :projects, "index_projects_on_team_membership_id", "index_projects_on_unit_role_id" if index_exists?(:projects, :unit_role_id, name: "index_projects_on_team_membership_id")
 
-    rename_index :unit_roles, "index_team_memberships_on_project_id", "index_unit_roles_on_project_id"
-    rename_index :unit_roles, "index_team_memberships_on_team_id", "index_unit_roles_on_team_id"
-    rename_index :unit_roles, "index_team_memberships_on_user_id", "index_unit_roles_on_user_id"
+    rename_index :unit_roles, "index_team_memberships_on_project_id", "index_unit_roles_on_project_id" if index_exists?(:unit_roles, :project_id, name: "index_team_memberships_on_project_id")
+    rename_index :unit_roles, "index_team_memberships_on_team_id", "index_unit_roles_on_team_id" if index_exists?(:unit_roles, :team_id, name: "index_team_memberships_on_team_id")
+    rename_index :unit_roles, "index_team_memberships_on_user_id", "index_unit_roles_on_user_id" if index_exists?(:unit_roles, :user_id, name: "index_team_memberships_on_user_id")
   end
 end

@@ -19,11 +19,34 @@ class AuthenticationApi < Grape::API
   if !AuthenticationHelpers.aaf_auth? && !AuthenticationHelpers.saml_auth?
     desc 'Sign in'
     params do
-      requires :username, type: String, desc: 'User username'
-      requires :password, type: String, desc: 'User\'s password'
+      optional :username, type: String, desc: 'User username'
+      optional :password, type: String, desc: 'User\'s password'
+      optional :auth_token, type: String, desc: 'Temporary auth token (Keycloak/Google sign-in flow)'
       optional :remember, type: Boolean, desc: 'User has requested to remember login', default: false
     end
     post '/auth' do
+      # Keycloak token exchange — used when Google sign-in redirects back with a one-time token
+      if AuthenticationHelpers.keycloak_enabled? && params[:auth_token].present? && params[:password].blank?
+        error!({ error: 'Invalid authentication details.' }, 404) if params[:username].blank?
+        logger.info "Get user via auth_token from #{request.ip} - #{params[:username]}"
+
+        if authenticated?(:login)
+          user = User.find_by(username: params[:username])
+          token = user.token_for_text?(params[:auth_token], :login) unless user.nil?
+          error!({ error: 'Invalid authentication details.' }, 404) if token.nil?
+
+          token.destroy!
+          token = user.generate_authentication_token!
+
+          logger.info "Login #{params[:username]} from #{request.ip}"
+
+          present :user, user, with: Entities::UserEntity
+          present :auth_token, token.authentication_token
+        end
+
+        next # skip password auth
+      end
+
       username = params[:username]
       password = params[:password]
       remember = params[:remember]
@@ -267,6 +290,128 @@ class AuthenticationApi < Grape::API
     end
   end
 
+  # ===========================================================================
+  # Keycloak OIDC endpoints — Google account linking and sign-in.
+  # Mounted only when DF_KEYCLOAK_URL is configured. Operates independently
+  # of auth_method so it works alongside both AAF and SAML deployments.
+  # ===========================================================================
+  if AuthenticationHelpers.keycloak_enabled?
+
+    #
+    # Initiate Google account linking for an already authenticated user.
+    # Returns a URL the frontend should redirect the browser to.
+    #
+    desc 'Initiate Google account link'
+    get '/auth/link/google' do
+      authenticated?(:general)
+
+      state = generate_oauth_state(mode: 'link', user_id: current_user.id)
+      url = keycloak_auth_url(
+        redirect_uri: keycloak_config[:link_callback],
+        state: state
+      )
+
+      present({ link_url: url }, with: Grape::Presenters::Presenter)
+    end
+
+    #
+    # Keycloak redirects here after the user authenticates with Google for linking.
+    # Verifies state, exchanges code, stores the linked login, redirects to frontend.
+    #
+    desc 'Keycloak callback for Google account linking'
+    params do
+      requires :code,  type: String, desc: 'Authorization code from Keycloak'
+      requires :state, type: String, desc: 'OAuth2 state parameter'
+    end
+    get '/auth/link/callback' do
+      host = Doubtfire::Application.config.institution[:host]
+      host = "#{Rails.env.development? ? 'http' : 'https'}://#{host}" unless host.starts_with?('http')
+
+      state_data = verify_oauth_state(params[:state])
+      return redirect "#{host}/account?link_error=invalid_state" if state_data.nil?
+      return redirect "#{host}/account?link_error=invalid_flow"  unless state_data['mode'] == 'link'
+
+      user = User.find_by(id: state_data['user_id'])
+      return redirect "#{host}/account?link_error=user_not_found" if user.nil?
+
+      tokens = exchange_keycloak_code(code: params[:code], redirect_uri: keycloak_config[:link_callback])
+      return redirect "#{host}/account?link_error=token_exchange_failed" if tokens.nil? || tokens['id_token'].blank?
+
+      claims = verify_keycloak_id_token(tokens['id_token'])
+      return redirect "#{host}/account?link_error=invalid_token" if claims.nil?
+
+      google_email = claims['email']
+      return redirect "#{host}/account?link_error=no_email" if google_email.blank?
+
+      existing = UserLinkedLogin.find_by(provider: 'google', provider_identifier: google_email)
+      if existing && existing.user_id != user.id
+        return redirect "#{host}/account?link_error=already_linked"
+      end
+
+      UserLinkedLogin.find_or_create_by!(user: user, provider: 'google') do |ll|
+        ll.provider_identifier = google_email
+      end
+
+      logger.info "Linked Google account #{google_email} to user #{user.username}"
+      redirect "#{host}/account?linked=google"
+    end
+
+    #
+    # Initiate Google sign-in (no auth required).
+    # Returns a URL the frontend should redirect the browser to.
+    #
+    desc 'Initiate Google sign-in'
+    get '/auth/google' do
+      state = generate_oauth_state(mode: 'signin')
+      url = keycloak_auth_url(
+        redirect_uri: keycloak_config[:signin_callback],
+        state: state
+      ) 
+
+      present({ signin_url: url }, with: Grape::Presenters::Presenter)
+    end
+
+    #
+    # Keycloak redirects here after Google sign-in.
+    # Looks up linked account, issues a one-time token, redirects to frontend.
+    # No new users are created — unlinked identities are rejected.
+    #
+    desc 'Keycloak callback for Google sign-in'
+    params do
+      requires :code,  type: String, desc: 'Authorization code from Keycloak'
+      requires :state, type: String, desc: 'OAuth2 state parameter'
+    end
+    get '/auth/google/callback' do
+      host = Doubtfire::Application.config.institution[:host]
+      host = "#{Rails.env.development? ? 'http' : 'https'}://#{host}" unless host.starts_with?('http')
+
+      state_data = verify_oauth_state(params[:state])
+      return redirect "#{host}/sign_in?error=invalid_state" if state_data.nil?
+      return redirect "#{host}/sign_in?error=invalid_flow"  unless state_data['mode'] == 'signin'
+
+      tokens = exchange_keycloak_code(code: params[:code], redirect_uri: keycloak_config[:signin_callback])
+      return redirect "#{host}/sign_in?error=token_exchange_failed" if tokens.nil? || tokens['id_token'].blank?
+
+      claims = verify_keycloak_id_token(tokens['id_token'])
+      return redirect "#{host}/sign_in?error=invalid_token" if claims.nil?
+
+      google_email = claims['email']
+      linked = UserLinkedLogin.find_by(provider: 'google', provider_identifier: google_email)
+
+      if linked.nil?
+        logger.info "Google sign-in for #{google_email} — no linked account found"
+        return redirect "#{host}/sign_in?error=no_linked_account"
+      end
+
+      user = linked.user
+      onetime_token = user.generate_temporary_authentication_token!
+
+      logger.info "Google sign-in for #{user.username} via #{google_email}"
+      redirect "#{host}/sign_in?authToken=#{onetime_token.authentication_token}&username=#{user.username}"
+    end
+
+  end
+
   #
   # Returns the current auth method
   #
@@ -282,6 +427,9 @@ class AuthenticationApi < Grape::API
         request = OneLogin::RubySaml::Authrequest.new
         request.create(AuthenticationHelpers.saml_settings)
       end
+
+    response[:google_signin_enabled] = keycloak_enabled?
+
     present response, with: Grape::Presenters::Presenter
   end
 

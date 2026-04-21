@@ -1,4 +1,6 @@
 require 'onelogin/ruby-saml'
+require 'net/http'
+require 'cgi'
 
 #
 # The AuthenticationHelpers include functions to check if the user
@@ -90,7 +92,7 @@ module AuthenticationHelpers
 
     if metadata_url
       idp_metadata_parser = OneLogin::RubySaml::IdpMetadataParser.new
-      settings = idp_metadata_parser.parse_remote(metadata_url)
+      settings = idp_metadata_parser.parse_remote(metadata_url, timeout: 5)
     else
       settings = OneLogin::RubySaml::Settings.new
       settings.idp_cert                     = Doubtfire::Application.config.saml[:idp_sso_cert]
@@ -130,5 +132,110 @@ module AuthenticationHelpers
   #
   def db_auth?
     Doubtfire::Application.config.auth_method == :database
+  end
+
+  # ===========================================================================
+  # Keycloak OIDC helpers — used for Google account linking and sign-in.
+  # Independent of auth_method; active whenever DF_KEYCLOAK_URL is set.
+  # ===========================================================================
+
+  #
+  # Returns true if Keycloak OIDC is configured
+  #
+  def keycloak_enabled?
+    Doubtfire::Application.config.respond_to?(:keycloak) &&
+      Doubtfire::Application.config.keycloak.present?
+  end
+
+  #
+  # Shorthand accessor for the Keycloak config hash
+  #
+  def keycloak_config
+    Doubtfire::Application.config.keycloak
+  end
+
+  #
+  # Base URL for Keycloak OIDC endpoints (server-to-server, uses container name)
+  #
+  def keycloak_oidc_base
+    "#{keycloak_config[:url]}/realms/#{keycloak_config[:realm]}/protocol/openid-connect"
+  end
+
+  #
+  # Builds the Keycloak OIDC authorization URL to redirect the browser to.
+  # kc_idp_hint=google tells Keycloak to skip its login page and go straight to Google.
+  #
+  def keycloak_auth_url(redirect_uri:, state:)
+    "#{keycloak_config[:public_url]}/realms/#{keycloak_config[:realm]}/protocol/openid-connect/auth" \
+    "?client_id=#{keycloak_config[:client_id]}" \
+    "&response_type=code" \
+    "&scope=openid+email+profile" \
+    "&kc_idp_hint=google" \
+    # Add "&prompt=select_account" here to force the Google account picker even when
+    # the user already has an active Google session in the browser.
+    "&redirect_uri=#{CGI.escape(redirect_uri)}" \
+    "&state=#{CGI.escape(state)}"
+  end
+
+  #
+  # Exchanges an authorization code for tokens via Keycloak's token endpoint.
+  # This is a server-to-server call — the browser never sees the client_secret.
+  # Returns the parsed JSON response hash, or nil on failure.
+  #
+  def exchange_keycloak_code(code:, redirect_uri:)
+    uri = URI("#{keycloak_oidc_base}/token")
+    response = Net::HTTP.post_form(uri, {
+      grant_type:    'authorization_code',
+      code:          code,
+      redirect_uri:  redirect_uri,
+      client_id:     keycloak_config[:client_id],
+      client_secret: keycloak_config[:client_secret]
+    })
+    JSON.parse(response.body)
+  rescue StandardError => e
+    Rails.logger.error "Keycloak token exchange failed: #{e.message}"
+    nil
+  end
+
+  #
+  # Fetches Keycloak's public JWKS and verifies an ID token JWT.
+  # Returns the decoded claims hash, or nil if verification fails.
+  #
+  def verify_keycloak_id_token(id_token)
+    jwks_uri = URI("#{keycloak_oidc_base}/certs") 
+    jwks_response = Net::HTTP.get(jwks_uri)
+    jwks = JSON::JWK::Set.new(JSON.parse(jwks_response))
+    JSON::JWT.decode(id_token, jwks)
+  rescue JSON::JWT::Exception => e
+    Rails.logger.error "Keycloak JWT verification failed: #{e.message}"
+    nil
+  rescue StandardError => e
+    Rails.logger.error "Keycloak JWKS fetch failed: #{e.message}"
+    nil
+  end
+
+  #
+  # Generates a short-lived signed state JWT for OAuth2 CSRF protection.
+  # mode: "link" carries user_id; mode: "signin" carries no user identity.
+  #
+  def generate_oauth_state(mode:, user_id: nil)
+    payload = {
+      mode:    mode,
+      user_id: user_id,
+      jti:     SecureRandom.hex(16),
+      exp:     Time.zone.now.to_i + 300
+    }
+    JSON::JWT.new(payload).sign(
+      Doubtfire::Application.credentials.secret_key_base, :HS256
+    ).to_s
+  end
+
+  #
+  # Decodes and verifies a state JWT. Returns the claims hash or nil if invalid.
+  #
+  def verify_oauth_state(state)
+    JSON::JWT.decode(state, Doubtfire::Application.credentials.secret_key_base)
+  rescue JSON::JWT::Exception
+    nil
   end
 end

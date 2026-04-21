@@ -143,6 +143,7 @@ class User < ApplicationRecord
   has_many    :unit_roles, dependent: :destroy, inverse_of: :user
   has_many    :projects, dependent: :restrict_with_exception, inverse_of: :user
   has_many    :auth_tokens, dependent: :destroy, inverse_of: :user
+  has_many    :linked_logins, class_name: 'UserLinkedLogin', dependent: :destroy
   has_many    :user_oauth_tokens, dependent: :destroy, inverse_of: :user
   has_many    :user_oauth_states, dependent: :destroy, inverse_of: :user
   has_one     :webcal, dependent: :destroy, inverse_of: :user
