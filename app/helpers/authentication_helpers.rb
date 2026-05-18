@@ -171,8 +171,6 @@ module AuthenticationHelpers
     "&response_type=code" \
     "&scope=openid+email+profile" \
     "&kc_idp_hint=google" \
-    # Add "&prompt=select_account" here to force the Google account picker even when
-    # the user already has an active Google session in the browser.
     "&redirect_uri=#{CGI.escape(redirect_uri)}" \
     "&state=#{CGI.escape(state)}"
   end
