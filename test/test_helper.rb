@@ -6,14 +6,16 @@ ENV["RAILS_ENV"] ||= "test"
 
 # Enable the Keycloak OIDC prototype routes during test boot. These routes are
 # mounted conditionally from config/application.rb, so the environment must be
-# present before the Rails app is loaded.
-ENV['DF_KEYCLOAK_URL'] ||= 'http://keycloak.test'
-ENV['DF_KEYCLOAK_PUBLIC_URL'] ||= 'http://localhost:8080'
-ENV['DF_KEYCLOAK_REALM'] ||= 'doubtfire'
-ENV['DF_KEYCLOAK_CLIENT_ID'] ||= 'doubtfire-api'
-ENV['DF_KEYCLOAK_CLIENT_SECRET'] ||= 'test-client-secret'
-ENV['DF_KEYCLOAK_LINK_CALLBACK'] ||= 'http://localhost:3000/api/auth/link/callback'
-ENV['DF_KEYCLOAK_SIGNIN_CALLBACK'] ||= 'http://localhost:3000/api/auth/google/callback'
+# present before the Rails app is loaded. Force-assign (not ||=) so tests are
+# deterministic regardless of the surrounding container/host environment —
+# docker-compose sets real Keycloak values that would otherwise leak in.
+ENV['DF_KEYCLOAK_URL'] = 'http://keycloak.test'
+ENV['DF_KEYCLOAK_PUBLIC_URL'] = 'http://localhost:8080'
+ENV['DF_KEYCLOAK_REALM'] = 'doubtfire'
+ENV['DF_KEYCLOAK_CLIENT_ID'] = 'doubtfire-api'
+ENV['DF_KEYCLOAK_CLIENT_SECRET'] = 'test-client-secret'
+ENV['DF_KEYCLOAK_LINK_CALLBACK'] = 'http://localhost:3000/api/auth/link/callback'
+ENV['DF_KEYCLOAK_SIGNIN_CALLBACK'] = 'http://localhost:3000/api/auth/google/callback'
 
 require_relative "../config/environment"
 # require File.expand_path('../../config/environment', __FILE__)
