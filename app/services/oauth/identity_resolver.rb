@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require 'securerandom'
-
 module Oauth
   class IdentityResolver
     Resolution = Struct.new(
@@ -34,7 +32,8 @@ module Oauth
 
       if existing_identity
         update_existing_identity!
-        return build_resolution(existing_identity.user, existing_identity, status: 'existing_identity', linked: false, new_user: false)
+        already_linked = linking_flow? && existing_identity.user_id == state.user_id
+        return build_resolution(existing_identity.user, existing_identity, status: 'existing_identity', linked: already_linked, new_user: false)
       end
 
       if linking_flow?
@@ -48,8 +47,10 @@ module Oauth
         return build_resolution(match_user, identity, status: 'matched_existing_user', linked: true, new_user: false)
       end
 
-      identity = create_user_and_identity!
-      build_resolution(identity.user, identity, status: 'created_user', linked: true, new_user: true)
+      raise ResolutionError.new(
+        'No existing OnTrack account matches this OAuth identity.',
+        code: 'no_matching_account'
+      )
     end
 
     private
@@ -112,7 +113,7 @@ module Oauth
     end
 
     def locate_user_by_email
-      email = verified_email || primary_email
+      email = verified_email
       return nil if email.blank?
 
       User.find_by(email: email.downcase)
@@ -127,53 +128,6 @@ module Oauth
         raw_info: merged_raw_info,
         refresh_token: credentials['refresh_token']
       )
-    end
-
-    def create_user_and_identity!
-      email = verified_email || primary_email
-      raise ResolutionError.new('OAuth provider did not supply an email address.', code: 'missing_email') if email.blank?
-
-      ensure_identity_is_available!
-
-      first_name, last_name = derive_names
-      username = generate_unique_username(email)
-
-      user = User.new(
-        first_name: first_name,
-        last_name: last_name,
-        email: email.downcase,
-        username: username,
-        nickname: first_name,
-        role_id: Role.student_id,
-        login_id: username
-      )
-      user.password = SecureRandom.hex(16)
-
-      unless user.save
-        raise ResolutionError.new("Unable to create user: #{user.errors.full_messages.join(', ')}", code: 'user_creation_failed')
-      end
-
-      link_identity!(user)
-    end
-
-    def derive_names
-      first = info['first_name'] || info['given_name'] || info['name']&.split&.first || 'OAuth'
-      last = info['last_name'] || info['family_name'] || info['name']&.split&.last || 'User'
-      [first, last]
-    end
-
-    def generate_unique_username(email)
-      base = email.split('@').first.downcase.gsub(/[^a-z0-9_.-]/, '')
-      base = 'user' if base.blank?
-      candidate = base
-      suffix = 0
-
-      while User.exists?(username: candidate)
-        suffix += 1
-        candidate = "#{base}#{suffix}"
-      end
-
-      candidate
     end
 
     def merged_raw_info
