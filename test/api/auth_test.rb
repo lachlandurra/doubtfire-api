@@ -319,7 +319,7 @@ class AuthTest < ActiveSupport::TestCase
     end
   end
 
-  def test_link_endpoint_returns_start_url_for_github
+  def test_link_endpoint_returns_provider_request_url_for_github
     with_auth_config(auth_method: :database, oauth_providers: oauth_provider_config_stub, oauth_enabled: true) do
       user = FactoryBot.create(:user)
       add_auth_header_for(user: user)
@@ -330,7 +330,12 @@ class AuthTest < ActiveSupport::TestCase
       assert_includes [200, 201], last_response.status
       body = last_response_body
 
-      assert_match(%r{^/api/auth/oauth/github/start\?oauth_state_token=}, body['redirect_to'])
+      match = body["redirect_to"].match(%r{^/api/auth/oauth/github[?]oauth_state_token=([^&]+)})
+      assert match, body['redirect_to']
+
+      state = OauthState.find_by(token: match[1])
+      assert_equal Api::OauthController::PURPOSE_LINK, state.purpose
+      assert_equal user.id, state.user_id
     ensure
       clear_auth_header
       header 'Host', nil

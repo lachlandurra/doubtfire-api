@@ -56,7 +56,7 @@ class AuthenticationApi < Grape::API
 
     def oauth_handshake_path(provider, state_token)
       query = { oauth_state_token: state_token }.to_query
-      "/api/auth/oauth/#{provider}/start?#{query}"
+      "/api/auth/oauth/#{provider}?#{query}"
     end
   end
 
