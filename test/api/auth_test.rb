@@ -342,6 +342,25 @@ class AuthTest < ActiveSupport::TestCase
     end
   end
 
+  def test_oauth_failure_redirect_uses_state_redirect_path
+    location = Api::OauthController.new.send(
+      :failure_redirect_url,
+      "google",
+      "no_matching_account",
+      redirect_path: "http://localhost:4200/sign_in"
+    )
+
+    uri = URI.parse(location)
+    assert_equal "http", uri.scheme
+    assert_equal "localhost", uri.host
+    assert_equal 4200, uri.port
+    assert_equal "/sign_in", uri.path
+
+    params = Rack::Utils.parse_nested_query(uri.query)
+    assert_equal "no_matching_account", params["oauth_error"]
+    assert_equal "OAuth sign-in failed", params["oauth_error_message"]
+  end
+
   def test_unlink_rejected_when_identity_is_last_sign_in_method
     with_auth_config(auth_method: :saml_oauth, oauth_providers: oauth_provider_config_stub, oauth_enabled: true) do
       user = FactoryBot.create(:user, login_id: 'oauthuser')

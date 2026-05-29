@@ -62,14 +62,16 @@ module Api
 
       if state_expired?(state)
         logger.warn("[OAuth] state expired before callback provider=#{provider_key} state=#{state_token}")
+        redirect_path = state.redirect_path
         state.destroy
-        return redirect_to failure_redirect_url(provider_key, 'state_expired')
+        return redirect_to failure_redirect_url(provider_key, 'state_expired', redirect_path: redirect_path)
       end
 
       unless auth_hash.present?
         logger.error("[OAuth] callback missing auth hash provider=#{provider_key} state=#{state_token}")
+        redirect_path = state.redirect_path
         state.destroy
-        return redirect_to failure_redirect_url(provider_key, 'missing_auth_hash')
+        return redirect_to failure_redirect_url(provider_key, 'missing_auth_hash', redirect_path: redirect_path)
       end
 
       resolver = Oauth::IdentityResolver.new(provider: provider_key, auth_hash: auth_hash, state: state)
@@ -84,10 +86,10 @@ module Api
       redirect_to next_location
     rescue Oauth::IdentityResolver::ResolutionError => e
       logger.warn("[OAuth] identity resolution failed provider=#{params[:provider]} state=#{state_token} code=#{e.code} message=#{e.message}")
-      redirect_to failure_redirect_url(params[:provider], e.code)
+      redirect_to failure_redirect_url(params[:provider], e.code, redirect_path: state&.redirect_path)
     rescue StandardError => e
       logger.error("[OAuth] callback processing failed provider=#{params[:provider]} state=#{state_token} error=#{e.class.name} message=#{e.message}")
-      redirect_to failure_redirect_url(params[:provider], 'unexpected_error')
+      redirect_to failure_redirect_url(params[:provider], 'unexpected_error', redirect_path: state&.redirect_path)
     ensure
       OauthState.cleanup_expired!
     end
@@ -259,8 +261,8 @@ module Api
       nil
     end
 
-    def failure_redirect_url(provider, code, message: nil)
-      fallback = default_callback_redirect_path
+    def failure_redirect_url(provider, code, message: nil, redirect_path: nil)
+      fallback = redirect_path.presence || default_callback_redirect_path
       uri = URI.parse(fallback)
       params = Rack::Utils.parse_nested_query(uri.query).merge(
         'oauth_error' => code.to_s,
